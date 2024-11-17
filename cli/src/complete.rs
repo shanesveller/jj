@@ -629,6 +629,44 @@ pub fn interdiff_files(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
     })
 }
 
+/// Specific function for completing file paths for `jj log`
+pub fn log_files(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return Vec::new();
+    };
+    let rev = parse::log_revision();
+    with_jj(|jj, _| {
+        let output = jj
+            .build()
+            .arg("log")
+            .arg("--no-graph")
+            .arg("--template=")
+            .arg("--summary")
+            .arg("--revisions")
+            .arg(rev)
+            .output()
+            .map_err(user_error)?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        Ok(stdout
+            .lines()
+            .filter_map(|line| {
+                let (_mode, path) = line.split_at(2);
+
+                if !path.starts_with(current) {
+                    return None;
+                }
+                if let Some(dir_path) = dir_prefix_from(path, current) {
+                    return Some(CompletionCandidate::new(dir_path));
+                }
+
+                Some(CompletionCandidate::new(path))
+            })
+            .dedup() // directories may occur multiple times
+            .collect())
+    })
+}
+
 /// Shell out to jj during dynamic completion generation
 ///
 /// In case of errors, print them and early return an empty vector.
@@ -769,7 +807,7 @@ impl JjBuilder {
 /// multiple times, the parsing will pick any of the available ones, while the
 /// actual execution of the command would fail.
 mod parse {
-    fn parse_flag(candidates: &[&str], mut args: impl Iterator<Item = String>) -> Option<String> {
+    fn parse_flag(candidates: &[&str], args: &mut impl Iterator<Item = String>) -> Option<String> {
         for arg in args.by_ref() {
             // -r REV syntax
             if candidates.contains(&arg.as_ref()) {
@@ -797,8 +835,8 @@ mod parse {
         None
     }
 
-    pub fn parse_revision_impl(args: impl Iterator<Item = String>) -> Option<String> {
-        parse_flag(&["-r", "--revision"], args)
+    pub fn parse_revision_impl(mut args: impl Iterator<Item = String>) -> Option<String> {
+        parse_flag(&["-r", "--revision"], &mut args)
     }
 
     pub fn revision() -> Option<String> {
@@ -813,8 +851,8 @@ mod parse {
     where
         T: Iterator<Item = String>,
     {
-        let from = parse_flag(&["-f", "--from"], args())?;
-        let to = parse_flag(&["-t", "--to"], args()).unwrap_or_else(|| "@".into());
+        let from = parse_flag(&["-f", "--from"], &mut args())?;
+        let to = parse_flag(&["-t", "--to"], &mut args()).unwrap_or_else(|| "@".into());
 
         Some((from, to))
     }
@@ -828,10 +866,35 @@ mod parse {
     // the files changed only in some other revision in the range between
     // --from and --to cannot be squashed into --to like that.
     pub fn squash_revision() -> Option<String> {
-        if let Some(rev) = parse_flag(&["-r", "--revision"], std::env::args()) {
+        if let Some(rev) = parse_flag(&["-r", "--revision"], &mut std::env::args()) {
             return Some(rev);
         }
-        parse_flag(&["-f", "--from"], std::env::args())
+        parse_flag(&["-f", "--from"], &mut std::env::args())
+    }
+
+    // Special parse function only for `jj log`. It has a --revisions flag,
+    // instead of the usual --revision, and it can be supplied multiple times.
+    // The default revset for log _with specified paths_ is 'all()', so it
+    // would be most "correct" to use that as the default. However, that is
+    // terrible for performance. Instead, we just complete the files in "@".
+    // If the user still wants to have completions for every file that has
+    // ever existed in the repository, they can still provide -r=all().
+    pub fn log_revision() -> String {
+        let candidates = &["-r", "--revisions"];
+        let mut args = std::env::args();
+
+        let union = std::iter::from_fn(|| parse_flag(candidates, &mut args))
+            // multiple -r arguments are interpreted as a union
+            .fold("none()".into(), |mut buf: String, rev| {
+                buf.push_str("|(");
+                buf.push_str(&rev);
+                buf.push(')');
+                buf
+            });
+        if union == "none()" {
+            return "@".into();
+        }
+        union
     }
 }
 
