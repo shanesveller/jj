@@ -222,7 +222,7 @@ fn do_git_clone(
     let mut fetch_tx = workspace_command.start_transaction();
 
     let stats = with_remote_git_callbacks(ui, None, |cb| {
-        git::fetch(
+        git::clone(
             fetch_tx.repo_mut(),
             &git_repo,
             remote_name,

@@ -2257,12 +2257,12 @@ fn test_init() {
 }
 
 #[test]
-fn test_fetch_empty_repo() {
+fn test_clone_empty_repo() {
     let test_data = GitRepoData::create();
     let git_settings = GitSettings::default();
 
     let mut tx = test_data.repo.start_transaction(&test_data.settings);
-    let stats = git::fetch(
+    let stats = git::clone(
         tx.repo_mut(),
         &test_data.git_repo,
         "origin",
@@ -2280,7 +2280,7 @@ fn test_fetch_empty_repo() {
 }
 
 #[test]
-fn test_fetch_initial_commit() {
+fn test_clone_initial_commit_head_is_not_set() {
     let test_data = GitRepoData::create();
     let git_settings = GitSettings {
         auto_local_bookmark: true,
@@ -2289,7 +2289,7 @@ fn test_fetch_initial_commit() {
     let initial_git_commit = empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
 
     let mut tx = test_data.repo.start_transaction(&test_data.settings);
-    let stats = git::fetch(
+    let stats = git::clone(
         tx.repo_mut(),
         &test_data.git_repo,
         "origin",
@@ -2331,6 +2331,68 @@ fn test_fetch_initial_commit() {
 }
 
 #[test]
+fn test_clone_initial_commit_head_is_set() {
+    let test_data = GitRepoData::create();
+    let git_settings = GitSettings {
+        auto_local_bookmark: true,
+        ..Default::default()
+    };
+    let initial_git_commit = empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
+    test_data.origin_repo.set_head("refs/heads/main").unwrap();
+    let new_git_commit = empty_git_commit(
+        &test_data.origin_repo,
+        "refs/heads/main",
+        &[&initial_git_commit],
+    );
+    test_data
+        .origin_repo
+        .reference("refs/tags/v1.0", new_git_commit.id(), false, "")
+        .unwrap();
+
+    let mut tx = test_data.repo.start_transaction(&test_data.settings);
+    let stats = git::clone(
+        tx.repo_mut(),
+        &test_data.git_repo,
+        "origin",
+        &[StringPattern::everything()],
+        git::RemoteCallbacks::default(),
+        &git_settings,
+        None,
+    )
+    .unwrap();
+    assert_eq!(stats.default_branch, Some("main".to_string()));
+    assert!(stats.import_stats.abandoned_commits.is_empty());
+    let repo = tx.commit("test").unwrap();
+    // The new commit visible after git::clone().
+    let view = repo.view();
+    assert!(view.heads().contains(&jj_id(&new_git_commit)));
+    let commit_target = RefTarget::normal(jj_id(&new_git_commit));
+    let commit_remote_ref = RemoteRef {
+        target: commit_target.clone(),
+        state: RemoteRefState::Tracking,
+    };
+    assert_eq!(
+        *view.git_refs(),
+        btreemap! {
+            "refs/remotes/origin/main".to_string() => commit_target.clone(),
+            "refs/tags/v1.0".to_string() => commit_target.clone(),
+
+        }
+    );
+    assert_eq!(
+        view.bookmarks().collect::<BTreeMap<_, _>>(),
+        btreemap! {
+            "main" => BookmarkTarget {
+                local_target: &commit_target,
+                remote_refs: vec![
+                    ("origin", &commit_remote_ref),
+                ],
+            },
+        }
+    );
+}
+
+#[test]
 fn test_fetch_success() {
     let mut test_data = GitRepoData::create();
     let git_settings = GitSettings {
@@ -2340,7 +2402,7 @@ fn test_fetch_success() {
     let initial_git_commit = empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
 
     let mut tx = test_data.repo.start_transaction(&test_data.settings);
-    git::fetch(
+    git::clone(
         tx.repo_mut(),
         &test_data.git_repo,
         "origin",

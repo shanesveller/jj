@@ -1229,6 +1229,126 @@ pub enum GitFetchError {
     InternalGitError(#[from] git2::Error),
 }
 
+struct GitFetch<'a> {
+    mut_repo: &'a mut MutableRepo,
+    git_repo: &'a git2::Repository,
+    git_settings: &'a GitSettings,
+    fetch_options: git2::FetchOptions<'a>,
+}
+
+impl<'a> GitFetch<'a> {
+    fn new(
+        mut_repo: &'a mut MutableRepo,
+        git_repo: &'a git2::Repository,
+        git_settings: &'a GitSettings,
+        fetch_options: git2::FetchOptions<'a>,
+    ) -> Self {
+        GitFetch {
+            mut_repo,
+            git_repo,
+            git_settings,
+            fetch_options,
+        }
+    }
+
+    fn fetch_options(
+        callbacks: RemoteCallbacks<'_>,
+        depth: Option<NonZeroU32>,
+    ) -> git2::FetchOptions<'_> {
+        let mut proxy_options = git2::ProxyOptions::new();
+        proxy_options.auto();
+
+        let mut fetch_options = git2::FetchOptions::new();
+        fetch_options.proxy_options(proxy_options);
+        fetch_options.remote_callbacks(callbacks.into_git());
+        if let Some(depth) = depth {
+            fetch_options.depth(depth.get().try_into().unwrap_or(i32::MAX));
+        }
+
+        fetch_options
+    }
+
+    fn fetch(
+        &mut self,
+        branch_names: &[StringPattern],
+        remote_name: &str,
+    ) -> Result<Option<String>, GitFetchError> {
+        // Perform a `git fetch` on the local git repo, updating the remote-tracking
+        // branches in the git repo.
+        let mut remote = self.git_repo.find_remote(remote_name).map_err(|err| {
+            if is_remote_not_found_err(&err) {
+                GitFetchError::NoSuchRemote(remote_name.to_string())
+            } else {
+                GitFetchError::InternalGitError(err)
+            }
+        })?;
+        // At this point, we are only updating Git's remote tracking branches, not the
+        // local branches.
+        let refspecs: Vec<_> = branch_names
+            .iter()
+            .map(|pattern| {
+                pattern
+                    .to_glob()
+                    .filter(|glob| !glob.contains(INVALID_REFSPEC_CHARS))
+                    .map(|glob| format!("+refs/heads/{glob}:refs/remotes/{remote_name}/{glob}"))
+            })
+            .collect::<Option<_>>()
+            .ok_or(GitFetchError::InvalidBranchPattern)?;
+        if refspecs.is_empty() {
+            // Don't fall back to the base refspecs.
+            return Ok(None);
+        }
+
+        tracing::debug!("remote.download");
+        remote.download(&refspecs, Some(&mut self.fetch_options))?;
+        tracing::debug!("remote.prune");
+        remote.prune(None)?;
+        tracing::debug!("remote.update_tips");
+        remote.update_tips(
+            None,
+            git2::RemoteUpdateFlags::empty(),
+            git2::AutotagOption::Unspecified,
+            None,
+        )?;
+
+        let mut default_branch = None;
+        if let Ok(default_ref_buf) = remote.default_branch() {
+            if let Some(default_ref) = default_ref_buf.as_str() {
+                // LocalBranch here is the local branch on the remote, so it's really the remote
+                // branch
+                if let Some(RefName::LocalBranch(branch_name)) = parse_git_ref(default_ref) {
+                    tracing::debug!(default_branch = branch_name);
+                    default_branch = Some(branch_name);
+                }
+            }
+        }
+        tracing::debug!("remote.disconnect");
+        remote.disconnect()?;
+        Ok(default_branch)
+    }
+
+    pub fn import_refs(
+        &mut self,
+        branch_names: &[StringPattern],
+        remote_names: &[&str],
+    ) -> Result<GitImportStats, GitImportError> {
+        // Import the remote-tracking branches into the jj repo and update jj's
+        // local branches. We also import local tags since remote tags should have
+        // been merged by Git.
+        tracing::debug!("import_refs");
+        import_some_refs(self.mut_repo, self.git_settings, |ref_name| {
+            remote_names
+                .iter()
+                .filter_map(|remote_name| {
+                    to_remote_branch(ref_name, remote_name)
+                        .map(|branch| branch_names.iter().any(|pattern| pattern.matches(branch)))
+                })
+                .next()
+                .unwrap_or(matches!(ref_name, RefName::Tag(_)))
+        })
+    }
+}
+
 /// Describes successful `fetch()` result.
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct GitFetchStats {
@@ -1239,6 +1359,30 @@ pub struct GitFetchStats {
 }
 
 #[tracing::instrument(skip(mut_repo, git_repo, callbacks))]
+pub fn clone(
+    mut_repo: &mut MutableRepo,
+    git_repo: &git2::Repository,
+    remote_name: &str,
+    branch_names: &[StringPattern],
+    callbacks: RemoteCallbacks<'_>,
+    git_settings: &GitSettings,
+    depth: Option<NonZeroU32>,
+) -> Result<GitFetchStats, GitFetchError> {
+    let mut git_fetch = GitFetch::new(
+        mut_repo,
+        git_repo,
+        git_settings,
+        GitFetch::fetch_options(callbacks, depth),
+    );
+    let default_branch = git_fetch.fetch(branch_names, remote_name)?;
+    let import_stats = git_fetch.import_refs(branch_names, &[remote_name])?;
+    let stats = GitFetchStats {
+        default_branch,
+        import_stats,
+    };
+    Ok(stats)
+}
+
 pub fn fetch(
     mut_repo: &mut MutableRepo,
     git_repo: &git2::Repository,
