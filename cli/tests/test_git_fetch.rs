@@ -237,10 +237,7 @@ fn test_git_fetch_nonexistent_remote() {
         &repo_path,
         &["git", "fetch", "--remote", "rem1", "--remote", "rem2"],
     );
-    insta::assert_snapshot!(stderr, @r###"
-    bookmark: rem1@rem1 [new] untracked
-    Error: No git remote named 'rem2'
-    "###);
+    insta::assert_snapshot!(stderr, @"Error: No git remote named 'rem2'");
     // No remote should have been fetched as part of the failing transaction
     insta::assert_snapshot!(get_bookmark_output(&test_env, &repo_path), @"");
 }
@@ -254,10 +251,7 @@ fn test_git_fetch_nonexistent_remote_from_config() {
     test_env.add_config(r#"git.fetch = ["rem1", "rem2"]"#);
 
     let stderr = &test_env.jj_cmd_failure(&repo_path, &["git", "fetch"]);
-    insta::assert_snapshot!(stderr, @r###"
-    bookmark: rem1@rem1 [new] untracked
-    Error: No git remote named 'rem2'
-    "###);
+    insta::assert_snapshot!(stderr, @"Error: No git remote named 'rem2'");
     // No remote should have been fetched as part of the failing transaction
     insta::assert_snapshot!(get_bookmark_output(&test_env, &repo_path), @"");
 }
